@@ -6,7 +6,8 @@ Reauthentication when issue with credentials are reported.
 Configuration of options through options flow.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 import operator
 import socket
 from types import MappingProxyType
@@ -17,6 +18,7 @@ import voluptuous as vol
 
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
+    ConfigEntry,
     ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
@@ -89,40 +91,13 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
-            self.config = {
-                CONF_HOST: user_input[CONF_HOST],
-                CONF_USERNAME: user_input[CONF_USERNAME],
-                CONF_PASSWORD: user_input[CONF_PASSWORD],
-                CONF_PORT: user_input.get(CONF_PORT),
-                CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL),
-                CONF_SITE_ID: DEFAULT_SITE_ID,
-            }
+            self.config = _config_from_input(user_input)
 
-            try:
-                hub = await get_unifi_api(self.hass, MappingProxyType(self.config))
-                await hub.sites.update()
-                self.sites = hub.sites
-
-            except AuthenticationRequired:
-                errors["base"] = "faulty_credentials"
-
-            except CannotConnect:
-                errors["base"] = "service_unavailable"
-
-            else:
-                if self.source == SOURCE_REAUTH:
-                    if (
-                        (reauth_unique_id := self._get_reauth_entry().unique_id)
-                        is not None
-                    ) and reauth_unique_id in self.sites:
-                        return await self.async_step_site(
-                            {CONF_SITE_ID: reauth_unique_id}
-                        )
-                    raise AbortFlow("unknown_site_id")
-
+            with _catch_unifi_api_flow_errors(errors):
+                self.sites = await self._async_update_sites(self.config)
                 return await self.async_step_site()
 
         if not (host := self.config.get(CONF_HOST, "")) and await _async_discover_unifi(
@@ -130,7 +105,7 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         ):
             host = "unifi"
 
-        data = self.reauth_schema or {
+        data = {
             vol.Required(CONF_HOST, default=host): str,
             vol.Required(CONF_USERNAME): str,
             vol.Required(CONF_PASSWORD): str,
@@ -159,10 +134,6 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
 
             config_entry = await self.async_set_unique_id(unique_id)
             abort_reason = "configuration_updated"
-
-            if self.source == SOURCE_REAUTH:
-                config_entry = self._get_reauth_entry()
-                abort_reason = "reauth_successful"
 
             if config_entry:
                 if (
@@ -193,23 +164,49 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Trigger a reauthentication flow."""
         reauth_entry = self._get_reauth_entry()
-
         self.context["title_placeholders"] = {
             CONF_HOST: reauth_entry.data[CONF_HOST],
             CONF_NAME: reauth_entry.title,
         }
 
-        self.reauth_schema = {
-            vol.Required(CONF_HOST, default=reauth_entry.data[CONF_HOST]): str,
-            vol.Required(CONF_USERNAME, default=reauth_entry.data[CONF_USERNAME]): str,
+        return await self.async_step_reconfigure()
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a reconfiguration flow."""
+        config_entry = self._get_reauth_or_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            config_data = _config_from_input(user_input)
+
+            with _catch_unifi_api_flow_errors(errors):
+                sites = await self._async_update_sites(config_data)
+
+                if (
+                    (unique_id := config_entry.unique_id) is not None
+                ) and unique_id in sites:
+                    config_data[CONF_SITE_ID] = sites[unique_id].name
+                    return self.async_update_reload_and_abort(
+                        config_entry, data_updates=config_data
+                    )
+                raise AbortFlow("unknown_site_id")
+
+        schema = {
+            vol.Required(CONF_HOST, default=config_entry.data[CONF_HOST]): str,
+            vol.Required(CONF_USERNAME, default=config_entry.data[CONF_USERNAME]): str,
             vol.Required(CONF_PASSWORD): str,
-            vol.Required(CONF_PORT, default=reauth_entry.data[CONF_PORT]): int,
+            vol.Required(CONF_PORT, default=config_entry.data[CONF_PORT]): int,
             vol.Required(
-                CONF_VERIFY_SSL, default=reauth_entry.data[CONF_VERIFY_SSL]
+                CONF_VERIFY_SSL, default=config_entry.data[CONF_VERIFY_SSL]
             ): bool,
         }
-
-        return await self.async_step_user()
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema(schema),
+            errors=errors,
+        )
 
     @override
     async def async_step_integration_discovery(
@@ -254,6 +251,19 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         self.context["configuration_url"] = f"https://{host}"
 
         return await self.async_step_user()
+
+    async def _async_update_sites(self, data: Mapping[str, Any]) -> Sites:
+        """Get updated sites through UniFi API."""
+        hub = await get_unifi_api(self.hass, MappingProxyType(data))
+        await hub.sites.update()
+        return hub.sites
+
+    @callback
+    def _get_reauth_or_reconfigure_entry(self) -> ConfigEntry:
+        """Return the config entry the current flow is modifying."""
+        if self.source == SOURCE_REAUTH:
+            return self._get_reauth_entry()
+        return self._get_reconfigure_entry()
 
 
 class UnifiOptionsFlowHandler(OptionsFlow):
@@ -403,3 +413,26 @@ async def _async_discover_unifi(hass: HomeAssistant) -> str | None:
         return await hass.async_add_executor_job(socket.gethostbyname, "unifi")
     except socket.gaierror:
         return None
+
+
+def _config_from_input(user_input: dict[str, Any]) -> dict[str, Any]:
+    """Build config entry data from user input."""
+    return {
+        CONF_HOST: user_input[CONF_HOST],
+        CONF_USERNAME: user_input[CONF_USERNAME],
+        CONF_PASSWORD: user_input[CONF_PASSWORD],
+        CONF_PORT: user_input.get(CONF_PORT),
+        CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL),
+        CONF_SITE_ID: DEFAULT_SITE_ID,
+    }
+
+
+@contextmanager
+def _catch_unifi_api_flow_errors(errors: dict[str, str]) -> Iterator[None]:
+    """Map UniFi API exceptions to config flow form errors."""
+    try:
+        yield
+    except AuthenticationRequired:
+        errors["base"] = "faulty_credentials"
+    except CannotConnect:
+        errors["base"] = "service_unavailable"

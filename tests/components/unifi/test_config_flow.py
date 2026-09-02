@@ -229,7 +229,8 @@ async def test_flow_aborts_configuration_updated(hass: HomeAssistant) -> None:
     assert result["step_id"] == "user"
 
     with patch("homeassistant.components.unifi.async_setup_entry") and patch(
-        "homeassistant.components.unifi.UnifiHub.available", new_callable=PropertyMock
+        "homeassistant.components.unifi.UnifiHub.available",
+        new_callable=PropertyMock,
     ) as ws_mock:
         ws_mock.return_value = False
         result = await hass.config_entries.flow.async_configure(
@@ -319,7 +320,7 @@ async def test_reauth_flow_update_configuration(
     result = await config_entry.start_reauth_flow(hass)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "reconfigure"
 
     context = next(
         flow["context"]
@@ -366,7 +367,7 @@ async def test_reauth_flow_update_configuration_on_not_loaded_entry(
     result = await config_entry.start_reauth_flow(hass)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "reconfigure"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -403,7 +404,108 @@ async def test_abort_reauth_flow_on_site_id_mismatch(
     result = await config_entry.start_reauth_flow(hass)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_HOST: "1.2.3.4",
+            CONF_USERNAME: "new_name",
+            CONF_PASSWORD: "new_pass",
+            CONF_PORT: 1234,
+            CONF_VERIFY_SSL: True,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown_site_id"
+    assert config_entry.data[CONF_SITE_ID] == "site_id"
+
+
+async def test_reconfigure_flow_update_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify reconfigure flow can update hub configuration."""
+    config_entry = config_entry_setup
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    with patch(
+        "homeassistant.components.unifi.UnifiHub.available", new_callable=PropertyMock
+    ) as ws_mock:
+        ws_mock.return_value = False
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "1.2.3.4",
+                CONF_USERNAME: "new_name",
+                CONF_PASSWORD: "new_pass",
+                CONF_PORT: 1234,
+                CONF_VERIFY_SSL: True,
+            },
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data[CONF_HOST] == "1.2.3.4"
+    assert config_entry.data[CONF_USERNAME] == "new_name"
+    assert config_entry.data[CONF_PASSWORD] == "new_pass"
+
+
+async def test_reconfigure_flow_update_configuration_on_not_loaded_entry(
+    hass: HomeAssistant, config_entry_factory: ConfigEntryFactoryType
+) -> None:
+    """Verify reconfigure flow can update hub configuration on a not loaded entry."""
+    with patch(
+        "homeassistant.components.unifi.get_unifi_api",
+        side_effect=CannotConnect,
+    ):
+        config_entry = await config_entry_factory()
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_HOST: "1.2.3.4",
+            CONF_USERNAME: "new_name",
+            CONF_PASSWORD: "new_pass",
+            CONF_PORT: 1234,
+            CONF_VERIFY_SSL: True,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data[CONF_HOST] == "1.2.3.4"
+    assert config_entry.data[CONF_USERNAME] == "new_name"
+    assert config_entry.data[CONF_PASSWORD] == "new_pass"
+
+
+@pytest.mark.parametrize(
+    "site_payload",
+    [
+        [
+            {"name": "site2", "role": "admin", "desc": "site2 name", "_id": "2"},
+        ]
+    ],
+)
+async def test_abort_reconfigure_flow_on_site_id_mismatch(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify reconfigure flow aborts when original site can no longer be found."""
+    config_entry = config_entry_setup
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
