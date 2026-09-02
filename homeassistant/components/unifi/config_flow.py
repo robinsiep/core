@@ -19,7 +19,6 @@ import voluptuous as vol
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
     ConfigEntry,
-    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -132,20 +131,8 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
             unique_id = user_input[CONF_SITE_ID]
             self.config[CONF_SITE_ID] = self.sites[unique_id].name
 
-            config_entry = await self.async_set_unique_id(unique_id)
-            abort_reason = "configuration_updated"
-
-            if config_entry:
-                if (
-                    config_entry.state is ConfigEntryState.LOADED
-                    and (hub := config_entry.runtime_data)
-                    and hub.available
-                ):
-                    return self.async_abort(reason="already_configured")
-
-                return self.async_update_and_abort(
-                    config_entry, data=self.config, reason=abort_reason
-                )
+            await self.async_set_unique_id(unique_id)
+            self._abort_if_unique_id_configured()
 
             site_nice_name = self.sites[unique_id].description
             return self.async_create_entry(title=site_nice_name, data=self.config)
